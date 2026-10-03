@@ -1,0 +1,12 @@
+drivers/all.go
+internal/driver/driver.go
+internal/driver/config.go
+internal/driver/item.go
+internal/model/args.go
+internal/model/object.go
+drivers/base/client.go
+drivers/local/driver.go
+drivers/123_share/meta.go
+drivers/google_photo/driver.go
+drivers/teldrive/driver_test.go
+go.mod
