@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
+	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/go-resty/resty/v2"
@@ -19,6 +20,18 @@ func iwaraTestClient(t *testing.T) func() {
 	old := base.RestyClient
 	base.RestyClient = resty.New()
 	return func() { base.RestyClient = old }
+}
+
+func TestGetRootImplementsGetRooter(t *testing.T) {
+	var _ driver.GetRooter = (*IwaraZip)(nil)
+	d := &IwaraZip{Addition: Addition{RootFolderID: "root-123"}}
+	root, err := d.GetRoot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.GetID() != "root-123" || !root.IsDir() {
+		t.Fatalf("unexpected root object: %#v", root)
+	}
 }
 
 func TestListReacquiresTokenAndMapsObjects(t *testing.T) {
@@ -41,7 +54,7 @@ func TestListReacquiresTokenAndMapsObjects(t *testing.T) {
 				_, _ = w.Write([]byte(`{"response":"access token expired","_status":"error"}`))
 				return
 			}
-			_, _ = w.Write([]byte(`{"data":{"folders":[{"id":"folder","folderName":"Docs","date_updated":"2025-01-02 03:04:05"}],"files":[{"id":"file","filename":"a.txt","size":42,"date_added":"2025-01-03 03:04:05"}]},"_status":"success"}`))
+			_, _ = w.Write([]byte(`{"data":{"folders":[{"id":"folder","folderName":"Docs","totalSize":"10","date_updated":"2025-01-02 03:04:05"}],"files":[{"id":"file","filename":"a.txt","fileSize":"42","date_added":"2025-01-03 03:04:05"}]},"_status":"success"}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -317,7 +330,7 @@ func TestPutUsesMultipartWholeFile(t *testing.T) {
 			_, _ = file.Read(buf)
 			gotContent = string(buf)
 		}
-		_, _ = w.Write([]byte(`{"data":{"id":"uploaded","filename":"x.txt","size":3},"_status":"success"}`))
+		_, _ = w.Write([]byte(`{"data":[{"file_id":"uploaded","name":"x.txt","size":"3"}],"_status":"success"}`))
 	}))
 	defer srv.Close()
 	d := &IwaraZip{Addition: Addition{Endpoint: srv.URL, APIKey1: "one", APIKey2: "two", RootFolderID: "root-123"}}
@@ -360,7 +373,7 @@ func TestUnauthorizedEnvelopeReacquiresToken(t *testing.T) {
 				_, _ = w.Write([]byte(`{"response":"generic request failure","_status":"error"}`))
 				return
 			}
-			_, _ = w.Write([]byte(`{"data":{"id":"uploaded","filename":"x.txt","size":3},"_status":"success"}`))
+			_, _ = w.Write([]byte(`{"data":[{"file_id":"uploaded","name":"x.txt","size":"3"}],"_status":"success"}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -376,6 +389,27 @@ func TestUnauthorizedEnvelopeReacquiresToken(t *testing.T) {
 	}
 	if authorizations != 3 || listings != 2 || uploads != 2 {
 		t.Fatalf("expected listing and upload retries with one token reacquire each, authorizations=%d listings=%d uploads=%d", authorizations, listings, uploads)
+	}
+}
+
+func TestNumericAccountIDIsAccepted(t *testing.T) {
+	cleanup := iwaraTestClient(t)
+	defer cleanup()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v2/authorize":
+			_, _ = w.Write([]byte(`{"data":{"access_token":"token","account_id":158642},"_status":"success"}`))
+		case "/api/v2/folder/listing":
+			_, _ = w.Write([]byte(`{"data":{"folders":[],"files":[]},"_status":"success"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	d := &IwaraZip{Addition: Addition{Endpoint: srv.URL, APIKey1: "one", APIKey2: "two"}}
+	if _, err := d.List(context.Background(), &model.Object{}, model.ListArgs{}); err != nil {
+		t.Fatalf("numeric account_id should be accepted: %v", err)
 	}
 }
 

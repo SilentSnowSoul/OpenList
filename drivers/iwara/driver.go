@@ -32,6 +32,15 @@ func (d *IwaraZip) Drop(ctx context.Context) error {
 	return nil
 }
 
+func (d *IwaraZip) GetRoot(ctx context.Context) (model.Obj, error) {
+	return &model.Object{
+		ID:       d.RootFolderID,
+		Path:     "/",
+		Name:     "root",
+		IsFolder: true,
+	}, nil
+}
+
 func (d *IwaraZip) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
 	return d.list(ctx, dir)
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	streamutil "github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/go-resty/resty/v2"
 )
 
 const tokenIdleTimeout = time.Hour
@@ -83,7 +84,7 @@ func (d *IwaraZip) authorize(ctx context.Context) error {
 		return errors.New("iwara authorization response missing access_token or account_id")
 	}
 	d.tokenMu.Lock()
-	d.accessToken, d.accountID, d.tokenUsed = data.AccessToken, data.AccountID, time.Now()
+	d.accessToken, d.accountID, d.tokenUsed = data.AccessToken, string(data.AccountID), time.Now()
 	d.tokenMu.Unlock()
 	return nil
 }
@@ -114,8 +115,7 @@ func (d *IwaraZip) invalidate(token string) {
 	d.tokenMu.Unlock()
 }
 
-func (d *IwaraZip) call(ctx context.Context, method, token, account string, body interface{}, result interface{}) *apiRequestError {
-	var envelope apiEnvelope
+func (d *IwaraZip) post(ctx context.Context, method, token, account string, body interface{}) (*resty.Response, error) {
 	params := map[string]string{"access_token": token, "account_id": account}
 	if values, ok := body.(map[string]interface{}); ok {
 		for key, value := range values {
@@ -126,15 +126,16 @@ func (d *IwaraZip) call(ctx context.Context, method, token, account string, body
 			params[key] = value
 		}
 	}
-	resp, err := base.RestyClient.R().SetContext(ctx).SetFormData(params).Post(d.apiURL(method))
-	if err != nil {
-		return &apiRequestError{err: err}
-	}
-	if jsonErr := json.Unmarshal(resp.Body(), &envelope); jsonErr != nil {
+	return base.RestyClient.R().SetContext(ctx).SetFormData(params).Post(d.apiURL(method))
+}
+
+func envelopeError(resp *resty.Response) *apiRequestError {
+	var envelope apiEnvelope
+	if err := json.Unmarshal(resp.Body(), &envelope); err != nil {
 		if !resp.IsSuccess() {
 			return &apiRequestError{err: errors.New(resp.String())}
 		}
-		return &apiRequestError{err: jsonErr}
+		return &apiRequestError{err: err}
 	}
 	if envelope.Status == "error" || envelope.LegacyStatus == "error" {
 		message := responseMessage(envelope.Response)
@@ -146,20 +147,53 @@ func (d *IwaraZip) call(ctx context.Context, method, token, account string, body
 	if !resp.IsSuccess() {
 		return &apiRequestError{err: errors.New(resp.String()), tokenInvalid: resp.StatusCode() == http.StatusUnauthorized}
 	}
-	if result != nil && len(envelope.Data) != 0 && string(envelope.Data) != "null" {
-		if err := json.Unmarshal(envelope.Data, result); err != nil {
+	return nil
+}
+
+func (d *IwaraZip) call(ctx context.Context, method, token, account string, body interface{}, result interface{}) *apiRequestError {
+	resp, err := d.post(ctx, method, token, account, body)
+	if err != nil {
+		return &apiRequestError{err: err}
+	}
+	if requestErr := envelopeError(resp); requestErr != nil {
+		return requestErr
+	}
+	if result != nil {
+		var envelope apiEnvelope
+		if err := json.Unmarshal(resp.Body(), &envelope); err != nil {
 			return &apiRequestError{err: err}
+		}
+		if len(envelope.Data) != 0 && string(envelope.Data) != "null" {
+			if err := json.Unmarshal(envelope.Data, result); err != nil {
+				return &apiRequestError{err: err}
+			}
 		}
 	}
 	return nil
 }
 
-func (d *IwaraZip) request(ctx context.Context, method string, body interface{}, result interface{}) error {
+// callFull decodes the whole response body, for endpoints whose payload
+// lives outside the top-level data field (e.g. file/copy).
+func (d *IwaraZip) callFull(ctx context.Context, method, token, account string, body interface{}, result interface{}) *apiRequestError {
+	resp, err := d.post(ctx, method, token, account, body)
+	if err != nil {
+		return &apiRequestError{err: err}
+	}
+	if requestErr := envelopeError(resp); requestErr != nil {
+		return requestErr
+	}
+	if err := json.Unmarshal(resp.Body(), result); err != nil {
+		return &apiRequestError{err: err}
+	}
+	return nil
+}
+
+func (d *IwaraZip) requestCall(ctx context.Context, method string, body, result interface{}, call func(ctx context.Context, method, token, account string, body, result interface{}) *apiRequestError) error {
 	token, account, err := d.token(ctx)
 	if err != nil {
 		return err
 	}
-	requestErr := d.call(ctx, method, token, account, body, result)
+	requestErr := call(ctx, method, token, account, body, result)
 	if requestErr == nil {
 		return nil
 	}
@@ -171,10 +205,14 @@ func (d *IwaraZip) request(ctx context.Context, method string, body interface{},
 	if err != nil {
 		return err
 	}
-	if retryErr := d.call(ctx, method, newToken, newAccount, body, result); retryErr != nil {
+	if retryErr := call(ctx, method, newToken, newAccount, body, result); retryErr != nil {
 		return retryErr
 	}
 	return nil
+}
+
+func (d *IwaraZip) request(ctx context.Context, method string, body interface{}, result interface{}) error {
+	return d.requestCall(ctx, method, body, result, d.call)
 }
 
 func folderID(dir model.Obj) string {
@@ -230,12 +268,12 @@ func objectTime(values ...string) time.Time {
 }
 
 func folderObject(folder apiFolder) model.Obj {
-	return &model.Object{ID: folder.ID, Name: folder.Name, Size: folder.Size,
+	return &model.Object{ID: string(folder.ID), Name: folder.Name, Size: folder.Size.int64(),
 		Modified: objectTime(folder.DateUpdate, folder.DateAdded), IsFolder: true}
 }
 
 func fileObject(file apiFile) model.Obj {
-	return &model.Object{ID: file.ID, Name: file.Name, Size: file.Size,
+	return &model.Object{ID: string(file.ID), Name: file.Name, Size: file.Size.int64(),
 		Modified: objectTime(file.DateUpdate, file.DateAdded)}
 }
 
@@ -301,12 +339,18 @@ func (d *IwaraZip) copy(ctx context.Context, src, dst model.Obj) (model.Obj, err
 	if src.IsDir() {
 		return nil, errs.NotImplement
 	}
-	var data apiFile
+	var data copyResponse
 	body := map[string]interface{}{"file_id": src.GetID(), "copy_to_folder_id": destinationFolderID(d, dst)}
-	if err := d.request(ctx, "file/copy", body, &data); err != nil {
+	if err := d.requestCall(ctx, "file/copy", body, &data, d.callFull); err != nil {
 		return nil, err
 	}
-	return fileObject(data), nil
+	var file apiFile
+	if len(data.NewFile.Data) != 0 {
+		if err := json.Unmarshal(data.NewFile.Data, &file); err != nil {
+			return nil, err
+		}
+	}
+	return fileObject(file), nil
 }
 
 func (d *IwaraZip) remove(ctx context.Context, obj model.Obj) error {
@@ -378,13 +422,16 @@ func (d *IwaraZip) putOnce(ctx context.Context, dst model.Obj, stream model.File
 	if !resp.IsSuccess() {
 		return nil, &apiRequestError{err: errors.New(resp.String()), tokenInvalid: resp.StatusCode() == http.StatusUnauthorized}
 	}
-	var data apiFile
+	var items []uploadItem
 	if len(envelope.Data) != 0 && string(envelope.Data) != "null" {
-		if err := json.Unmarshal(envelope.Data, &data); err != nil {
+		if err := json.Unmarshal(envelope.Data, &items); err != nil {
 			return nil, &apiRequestError{err: err}
 		}
 	}
-	return fileObject(data), nil
+	if len(items) == 0 || items[0].FileID == "" {
+		return nil, &apiRequestError{err: errors.New("iwara upload response missing file_id")}
+	}
+	return &model.Object{ID: string(items[0].FileID), Name: items[0].Name, Size: items[0].Size.int64()}, nil
 }
 
 
